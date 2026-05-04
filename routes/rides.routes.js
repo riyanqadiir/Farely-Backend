@@ -9,6 +9,9 @@ router.use(protect);
 // POST /rides/compare
 router.post("/compare", ridesController.compare);
 
+// GET /rides/pakistan-fuel — OGRA-linked petrol/diesel snapshot + ride fuel multiplier (cached)
+router.get("/pakistan-fuel", ridesController.pakistanFuel);
+
 // POST /rides/estimate-min — minimum base fare for coords + ride type (no bookings)
 router.post("/estimate-min", ridesController.estimateMin);
 router.post("/provider-selection", ridesController.logProviderSelection);

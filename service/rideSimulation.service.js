@@ -17,30 +17,90 @@ function calcEtaMinutes(distanceKm, avgSpeedKmh = 28) {
   return Math.max(1, Math.round(minutes));
 }
 
+/**
+ * Heuristic PK urban ride costs (no official APIs).
+ * Calibrated so ~5.3 km car (no AC) is in the ballpark of real Yango / Bykea (Alto-class vs Wagon-R–class fleet).
+ */
 const RIDE_TYPE_BASE = {
-  bike: { baseFare: 90, perKmRate: 28 },
-  rickshaw: { baseFare: 120, perKmRate: 34 },
-  car: { baseFare: 150, perKmRate: 40 },
-  /** Car with AC — between car and premium for demo coefficients. */
-  car_ac: { baseFare: 175, perKmRate: 46 },
-  premium: { baseFare: 240, perKmRate: 62 },
+  bike: { baseFare: 72, perKmRate: 22 },
+  rickshaw: { baseFare: 88, perKmRate: 26 },
+  car: { baseFare: 78, perKmRate: 35 },
+  /** Car with AC — modest uplift vs no-AC car bucket. */
+  car_ac: { baseFare: 92, perKmRate: 40 },
+  premium: { baseFare: 120, perKmRate: 48 },
 };
 
+/**
+ * Default fuel factor when live POL snapshot is not applied (see pakistanFuel.service).
+ * Kept modest so estimates track in-app quotes; raise via env / fuel service when POL spikes.
+ */
+const FUEL_SURCHARGE_MULTIPLIER = 1.03;
+
 const PROVIDER_CONFIG = {
-  /** Uber: estimates only until Rider API is enabled (no in-app booking). */
-  Uber: { multiplier: 0.98, baseAdd: 12, etaMultiplier: 1.0, confidence: 0.82 },
-  Yango: { multiplier: 0.96, baseAdd: 10, etaMultiplier: 1.0, confidence: 0.8 },
-  /** Bike-first local player; coefficients slightly below car-first apps for bike-like estimates. */
-  Bykea: { multiplier: 0.9, baseAdd: 8, etaMultiplier: 1.05, confidence: 0.68 },
+  /** Yango: lighter fleet (e.g. Alto) — lower per-trip tilt vs Bykea. */
+  Yango: {
+    baseAdd: 8,
+    etaMultiplier: 1.0,
+    confidence: 0.74,
+    priceTilt: 0.88,
+  },
+  /** Bykea: heavier local fleet (e.g. Wagon R) — higher tilt; ~25–32% above Yango at same km. */
+  Bykea: {
+    baseAdd: 18,
+    etaMultiplier: 1.02,
+    confidence: 0.71,
+    priceTilt: 1.1,
+  },
 };
+
+/** Bykea must read higher than Yango on the same route (PK market), even if scrapes round the same. */
+const MIN_BYKEA_VS_YANGO_RATIO = 1.15;
+
+function enforceYangoBykeaFareSpread(comparisons) {
+  if (!Array.isArray(comparisons)) return comparisons;
+  const out = comparisons.map((c) => ({ ...c }));
+  const yi = out.findIndex((c) => c.provider === 'Yango');
+  const bi = out.findIndex((c) => c.provider === 'Bykea');
+  if (yi < 0 || bi < 0) return out;
+  const yFare = Number(out[yi].fare);
+  const bFare = Number(out[bi].fare);
+  if (!Number.isFinite(yFare) || !Number.isFinite(bFare)) return out;
+  const minBykea = Math.max(Math.round(yFare * MIN_BYKEA_VS_YANGO_RATIO), yFare + 15);
+  if (bFare >= minBykea) return out;
+  out[bi] = { ...out[bi], fare: minBykea };
+  return out;
+}
+
+/** Asia/Karachi demand bump for rush / weekend (caps total surge). */
+function pakistanDemandMultiplier(date = new Date()) {
+  const hour = parseInt(
+    new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Karachi',
+      hour: 'numeric',
+      hour12: false,
+    }).format(date),
+    10
+  );
+  const weekday = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Karachi',
+    weekday: 'short',
+  }).format(date);
+  const isFri = weekday === 'Fri';
+  const isWeekend = weekday === 'Sat' || weekday === 'Sun';
+
+  let m = 1.0;
+  if (hour >= 7 && hour <= 10) m = Math.max(m, 1.06);
+  if (hour >= 17 && hour <= 21) m = Math.max(m, 1.1);
+  if (hour >= 22 || hour <= 5) m = Math.max(m, 1.03);
+  if (isFri && hour >= 16 && hour <= 21) m = Math.max(m, 1.12);
+  if (isWeekend && hour >= 12 && hour <= 23) m = Math.max(m, 1.06);
+  return Math.min(1.15, m);
+}
 
 /** One column per provider: ride-type label only (brand prefix applied when building the name). */
 const PROVIDER_RIDE_LABELS = {
   Yango: {
     bike: 'Moto', rickshaw: 'Rickshaw', car: 'Comfort', car_ac: 'Comfort AC', premium: 'Premier',
-  },
-  Uber: {
-    bike: 'Moto', rickshaw: 'Rickshaw', car: 'UberX', car_ac: 'Comfort', premium: 'Premier',
   },
   Bykea: {
     bike: 'Bike', rickshaw: 'Rickshaw', car: 'Car', car_ac: 'Car AC', premium: 'Plus',
@@ -48,7 +108,6 @@ const PROVIDER_RIDE_LABELS = {
 };
 
 const PROVIDER_BRAND = {
-  Uber: 'Uber',
   Yango: 'Yango',
   Bykea: 'Bykea',
 };
@@ -85,7 +144,53 @@ function computeBaseEstimate(rideType, distanceKm) {
   };
 }
 
-function estimateMinFare({ pickupCoords, destinationCoords, rideType, carAc }) {
+/** Normalize client calibration rows to Yango / Bykea only (UI scrapes for this route). */
+function parseLiveCalibrationRows(raw) {
+  if (!Array.isArray(raw) || raw.length === 0) return [];
+  const out = [];
+  for (const row of raw) {
+    const fare = Number(row?.fare);
+    const label = String(row?.provider || '').trim().toLowerCase();
+    if (!Number.isFinite(fare) || fare < 80 || fare > 2_000_000) continue;
+    let provider = '';
+    if (label.includes('yango') || label.includes('yandex')) provider = 'Yango';
+    else if (label.includes('bykea') || label.includes('bykia')) provider = 'Bykea';
+    if (!provider) continue;
+    out.push({ provider, fare });
+  }
+  return out;
+}
+
+/**
+ * Blend model minimum with observed Yango/Bykea fares (same ride-type bucket).
+ * Weight favors scrapes so the floor tracks what riders actually see in those apps.
+ */
+function blendBaseFareWithScrapes(modelBaseFare, scrapedRows) {
+  if (!scrapedRows.length) {
+    return { baseFare: modelBaseFare, calibratedFromScrapes: false };
+  }
+  const outlierCap = Math.min(80000, Math.max(18000, Math.round(modelBaseFare * 5)));
+  const saneRows = scrapedRows.filter((r) => r.fare >= 80 && r.fare <= outlierCap);
+  if (!saneRows.length) {
+    return { baseFare: modelBaseFare, calibratedFromScrapes: false };
+  }
+  const fares = saneRows.map((r) => r.fare);
+  const avg = fares.reduce((a, b) => a + b, 0) / fares.length;
+  const minL = Math.min(...fares);
+  const maxL = Math.max(...fares);
+  const blended = Math.round(modelBaseFare * 0.28 + avg * 0.72);
+  const clamped = Math.max(
+    Math.round(minL * 0.92),
+    Math.min(blended, Math.round(maxL * 1.12))
+  );
+  return {
+    baseFare: Math.max(80, clamped),
+    calibratedFromScrapes: true,
+    scrapedSampleCount: fares.length,
+  };
+}
+
+function estimateMinFare({ pickupCoords, destinationCoords, rideType, carAc, liveCalibration }) {
   if (!pickupCoords || !destinationCoords) {
     const err = new Error('Pickup and destination coordinates are required');
     err.statusCode = 400;
@@ -107,20 +212,48 @@ function estimateMinFare({ pickupCoords, destinationCoords, rideType, carAc }) {
   const distanceKm = haversineKm(lat1, lon1, lat2, lon2);
   const fareModel = resolveFareModel(rideType, carAc);
   const base = computeBaseEstimate(fareModel, distanceKm);
+  const scraped = parseLiveCalibrationRows(liveCalibration);
+  const scrapeCap = Math.min(80000, Math.max(3500, Math.round(base.baseFare * 6)));
+  const scrapedSane = scraped.filter((r) => r.fare <= scrapeCap);
+  const { baseFare: blendedBase, calibratedFromScrapes, scrapedSampleCount } = blendBaseFareWithScrapes(
+    base.baseFare,
+    scrapedSane
+  );
 
   return {
-    baseFare: base.baseFare,
+    baseFare: blendedBase,
     perKmRate: base.perKmRate,
     distanceKm: Number(distanceKm.toFixed(2)),
     rideType: String(rideType || 'car').trim().toLowerCase(),
     carAc: fareModel === 'car_ac',
     fareModel,
-    estimateConfidence: 0.78,
-    pricingModel: 'base_fare_plus_per_km',
+    estimateConfidence: calibratedFromScrapes ? 0.88 : 0.78,
+    pricingModel: calibratedFromScrapes
+      ? 'base_fare_plus_per_km_calibrated_yango_bykea'
+      : 'base_fare_plus_per_km',
+    calibratedFromScrapes: Boolean(calibratedFromScrapes),
+    ...(typeof scrapedSampleCount === 'number' ? { scrapedSampleCount } : {}),
   };
 }
 
-function findRides({ pickup, destination, pickupCoords, destinationCoords, rideType, carAc }) {
+function resolveFuelMultiplier(explicit) {
+  if (typeof explicit === 'number' && Number.isFinite(explicit) && explicit >= 0.94 && explicit <= 1.3) {
+    return explicit;
+  }
+  return FUEL_SURCHARGE_MULTIPLIER;
+}
+
+function findRides({
+  pickup,
+  destination,
+  pickupCoords,
+  destinationCoords,
+  rideType,
+  carAc,
+  liveCalibration,
+  fuelMultiplier: fuelMultiplierExplicit,
+  fuelPricingSource,
+}) {
   if (!pickup || !destination) {
     const err = new Error('Please provide pickup and destination');
     err.statusCode = 400;
@@ -142,46 +275,89 @@ function findRides({ pickup, destination, pickupCoords, destinationCoords, rideT
   const userRideType = String(rideType || 'car').trim().toLowerCase();
   const fareModel = resolveFareModel(userRideType, carAc);
   const base = computeBaseEstimate(fareModel, distanceKm);
+  const scraped = parseLiveCalibrationRows(liveCalibration);
+  const scrapeCap = Math.min(80000, Math.max(3500, Math.round(base.baseFare * 6)));
+  const scrapedSane = scraped.filter((r) => r.fare <= scrapeCap);
+  const scrapedByProvider = new Map();
+  for (const row of scrapedSane) {
+    scrapedByProvider.set(row.provider, row.fare);
+  }
+  const blendMeta = blendBaseFareWithScrapes(base.baseFare, scrapedSane);
+  const demandMul = pakistanDemandMultiplier();
+  const fuelMul = resolveFuelMultiplier(fuelMultiplierExplicit);
+  const coreEstimate = Math.max(base.baseFare, blendMeta.baseFare);
+
   const providers = Object.keys(PROVIDER_CONFIG);
 
   const comparisons = providers.map((provider) => {
     const cfg = PROVIDER_CONFIG[provider];
-    const estimate = Math.max(
-      base.baseFare,
-      Math.round((base.baseFare + cfg.baseAdd) * cfg.multiplier)
-    );
+    const tilt = typeof cfg.priceTilt === 'number' ? cfg.priceTilt : 1;
+    let estimate = Math.round(coreEstimate * tilt * demandMul * fuelMul + cfg.baseAdd);
+    estimate = Math.max(base.baseFare, estimate);
+    const live = scrapedByProvider.get(provider);
+    let fare = estimate;
+    let estimateConfidence = cfg.confidence;
+    let fareSource;
+    if (typeof live === 'number' && Number.isFinite(live) && live >= 80 && live <= Math.min(80000, coreEstimate * 6)) {
+      fare = Math.round(estimate * 0.35 + live * 0.65);
+      fare = Math.max(base.baseFare, fare);
+      estimateConfidence = Math.min(0.96, cfg.confidence + 0.14);
+      fareSource = 'scraped_blend';
+    }
     const etaMins = calcEtaMinutes(distanceKm * cfg.etaMultiplier);
     return {
       id: `${provider.toLowerCase()}_${Date.now()}`,
       provider,
       name: providerDisplayName(provider, fareModel),
-      fare: estimate,
+      fare,
       eta: `${etaMins} mins`,
       rideType: userRideType,
       carAc: fareModel === 'car_ac',
       fareModel,
       distanceKm: Number(distanceKm.toFixed(2)),
-      estimateConfidence: cfg.confidence,
+      estimateConfidence,
       pricingBreakdown: {
         baseFare: base.baseFare,
         perKmRate: base.perKmRate,
-        providerMultiplier: cfg.multiplier,
+        blendedCore: blendMeta.baseFare,
+        providerPriceTilt: tilt,
+        demandMultiplier: demandMul,
+        fuelMultiplier: fuelMul,
         providerBaseAdd: cfg.baseAdd,
       },
       isEstimate: true,
+      ...(fareSource ? { fareSource } : {}),
     };
   });
 
+  const comparisonsSpread = enforceYangoBykeaFareSpread(comparisons);
+
   return {
-    baseFare: base.baseFare,
+    baseFare: blendMeta.baseFare,
+    calibratedFromScrapes: Boolean(blendMeta.calibratedFromScrapes),
+    ...(typeof blendMeta.scrapedSampleCount === 'number'
+      ? { scrapedSampleCount: blendMeta.scrapedSampleCount }
+      : {}),
     perKmRate: base.perKmRate,
     distanceKm: Number(distanceKm.toFixed(2)),
     rideType: userRideType,
     carAc: fareModel === 'car_ac',
     fareModel,
-    pricingModel: 'base_fare_plus_per_km_with_provider_coefficients',
-    estimateNotice: 'Final fare and booking confirmation happen inside provider apps.',
-    comparisons,
+    pricingModel: blendMeta.calibratedFromScrapes
+      ? 'base_fare_plus_per_km_with_provider_coefficients_calibrated_yango_bykea'
+      : 'base_fare_plus_per_km_with_provider_coefficients',
+    estimateNotice: (() => {
+      let msg =
+        'Estimates are Farely heuristics (not official Yango/Bykea APIs). Yango is modeled cheaper than Bykea (typical Alto-class vs Wagon-R–class economics); a light peak-time bump applies in Asia/Karachi hours. ';
+      if (fuelPricingSource && fuelPricingSource !== 'fallback') {
+        msg += `Fuel factor uses POL snapshot (source: ${fuelPricingSource}). `;
+      } else {
+        msg += 'Fuel factor uses the default until PAK_PETROL_PKR, PAK_FUEL_JSON_URL, or OGRA parse succeeds — see GET /rides/pakistan-fuel. ';
+      }
+      msg += 'Final price is always in the provider app.';
+      return msg;
+    })(),
+    comparisons: comparisonsSpread,
   };
 }
 
@@ -202,5 +378,6 @@ module.exports = {
   findRides,
   bookRide,
   estimateMinFare,
+  FUEL_SURCHARGE_MULTIPLIER,
 };
 

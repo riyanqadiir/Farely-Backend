@@ -1,4 +1,5 @@
 const rideSimulationService = require("../service/rideSimulation.service");
+const pakistanFuelService = require("../service/pakistanFuel.service");
 const RideSearchLog = require("../model/RideSearchLog.model");
 const ProviderSelectionLog = require("../model/ProviderSelectionLog.model");
 const RideHandoff = require("../model/RideHandoff.model");
@@ -165,6 +166,9 @@ async function compare(req, res, next) {
       destinationLng,
     });
 
+    const { liveCalibration } = req.body || {};
+
+    const fuelSnap = await pakistanFuelService.getPakistanFuelSnapshot();
     const data = rideSimulationService.findRides({
       pickup,
       destination,
@@ -172,7 +176,19 @@ async function compare(req, res, next) {
       destinationCoords,
       rideType,
       carAc: carAcEffective,
+      liveCalibration,
+      fuelMultiplier: fuelSnap.fuelMultiplierForRides,
+      fuelPricingSource: fuelSnap.source,
     });
+    data.pakistanFuel = {
+      petrolPkrPerL: fuelSnap.petrolPkrPerL,
+      dieselPkrPerL: fuelSnap.dieselPkrPerL,
+      source: fuelSnap.source,
+      effectiveFrom: fuelSnap.effectiveFrom,
+      fuelMultiplierForRides: fuelSnap.fuelMultiplierForRides,
+      baselinePetrolPkrUsed: fuelSnap.baselinePetrolPkrUsed,
+      fetchedAt: fuelSnap.fetchedAt,
+    };
     const searchLog = await RideSearchLog.create({
       userId: req.userId,
       pickup,
@@ -223,6 +239,7 @@ async function estimateMin(req, res, next) {
       destinationLng,
       rideType,
       carAc,
+      liveCalibration,
     } = req.body || {};
 
     const carAcEffective = effectiveCarAc(rideType, parseCarAcFlag(carAc));
@@ -239,6 +256,7 @@ async function estimateMin(req, res, next) {
       destinationCoords,
       rideType,
       carAc: carAcEffective,
+      liveCalibration,
     });
     return res.json(data);
   } catch (err) {
@@ -432,6 +450,27 @@ async function listRideHistory(req, res, next) {
   }
 }
 
+async function pakistanFuel(req, res, next) {
+  try {
+    const snap = await pakistanFuelService.getPakistanFuelSnapshot();
+    return res.json({
+      success: true,
+      petrolPkrPerL: snap.petrolPkrPerL,
+      dieselPkrPerL: snap.dieselPkrPerL,
+      effectiveFrom: snap.effectiveFrom,
+      source: snap.source,
+      fuelMultiplierForRides: snap.fuelMultiplierForRides,
+      baselinePetrolPkrUsed: snap.baselinePetrolPkrUsed,
+      fetchedAt: snap.fetchedAt,
+      note:
+        'Official OGRA publishes fortnightly prices on ogra.org.pk; there is no stable public JSON API. '
+        + 'Set PAK_PETROL_PKR after each OGRA notification, or PAK_FUEL_JSON_URL to your own JSON feed, for exact figures.',
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
 async function listPendingRideReviews(req, res, next) {
   try {
     const docs = await RideHandoff.find({
@@ -453,6 +492,7 @@ async function listPendingRideReviews(req, res, next) {
 module.exports = {
   compare,
   estimateMin,
+  pakistanFuel,
   logProviderSelection,
   recordRideHandoff,
   confirmRideHandoff,

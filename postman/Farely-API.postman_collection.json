@@ -366,7 +366,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"transactionId\": \"pay_123456\",\n  \"rideId\": \"ride_abc\",\n  \"method\": \"cash\",\n  \"amount\": 800,\n  \"paymentMethodId\": null,\n  \"meta\": {\n    \"provider\": \"Uber\",\n    \"pickup\": \"A\",\n    \"destination\": \"B\"\n  }\n}"
+              "raw": "{\n  \"transactionId\": \"pay_123456\",\n  \"rideId\": \"ride_abc\",\n  \"method\": \"cash\",\n  \"amount\": 800,\n  \"paymentMethodId\": null,\n  \"meta\": {\n    \"provider\": \"Yango\",\n    \"pickup\": \"A\",\n    \"destination\": \"B\"\n  }\n}"
             },
             "url": "{{baseUrl}}/wallet/pay",
             "description": "Use method cash/card/wallet. For card include paymentMethodId."
