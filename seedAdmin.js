@@ -30,7 +30,6 @@ const seedAdmin = async () => {
       phone: adminPhone,
       password: hashedPassword,
       role: 'admin',
-      walletBalance: 1000,
       phoneVerified: true,
     });
 

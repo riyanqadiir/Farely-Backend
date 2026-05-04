@@ -51,8 +51,6 @@ const UserSchema = new mongoose.Schema(
       enum: ["user", "admin"],
       default: "user",
     },
-    stripeCustomerId: { type: String, default: null },
-    walletBalance: { type: Number, default: 0 },
     passwordChangedAt: { type: Date, default: null },
     passwordResetRequestedAt: { type: Date, default: null },
     lastPasswordResetAt: { type: Date, default: null },
