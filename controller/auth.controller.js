@@ -4,15 +4,9 @@ const otpService = require("../services/otp.service");
 const emailService = require("../services/email.service");
 const smsService = require("../services/sms.service");
 const { signToken } = require("../middleware/auth.middleware");
-const { OAuth2Client } = require("google-auth-library");
+const { isUserBlocked, blockedResponseBody } = require("../utility/userBlock");
+const { respondAccountNoLongerAvailable } = require("../utility/accountGoneResponse");
 
-// Support Android, iOS, and Web client: token audience can be any of these
-const googleAudiences = [
-  process.env.GOOGLE_CLIENT_ID,
-  process.env.GOOGLE_IOS_CLIENT_ID,
-  process.env.GOOGLE_WEB_CLIENT_ID,
-].filter(Boolean);
-const hasGoogleAuth = googleAudiences.length > 0;
 const isTwilioVerifyEnabled = process.env.ENABLE_TWILIO_VERIFY === "true";
 const isPhoneOtpEnabled = process.env.ENABLE_PHONE_OTP === "true";
 
@@ -27,6 +21,38 @@ function fullPhone(phone, countryCode) {
   const p = phone.replace(/\D/g, "");
   const cc = (countryCode || "+92").replace(/\D/g, "");
   return (cc ? "+" + cc : "") + p;
+}
+
+/** Values to try against `users.phone` when logging in (Pakistan-friendly). */
+function loginPhoneCandidates(rawLoginId) {
+  const trimmed = String(rawLoginId || "").trim();
+  if (!trimmed || trimmed.includes("@")) return [];
+  const digits = trimmed.replace(/\D/g, "");
+  const out = new Set();
+  if (trimmed.replace(/\s/g, "")) out.add(trimmed.replace(/\s/g, ""));
+  if (digits) {
+    out.add(digits);
+    if (digits.startsWith("0") && digits.length >= 10) {
+      out.add(`+92${digits.slice(1)}`);
+    }
+    if (!digits.startsWith("0") && digits.length >= 10) {
+      out.add(`+92${digits}`);
+    }
+    // PK mobile often stored as 03XXXXXXXXX; user may type 3XXXXXXXXX (no leading 0).
+    if (digits.length === 10 && /^3\d{9}$/.test(digits)) {
+      out.add(`0${digits}`);
+    }
+  }
+  return [...out].filter(Boolean);
+}
+
+function buildLoginQuery(loginIdRaw) {
+  const id = String(loginIdRaw || "").trim().toLowerCase();
+  const or = [{ email: id }];
+  for (const p of loginPhoneCandidates(loginIdRaw)) {
+    or.push({ phone: p });
+  }
+  return { $or: or };
 }
 
 function phoneOtpDisabled(channel, res) {
@@ -275,6 +301,10 @@ async function setPassword(req, res, next) {
     user.passwordChangedAt = new Date();
     await user.save();
 
+    if (isUserBlocked(user)) {
+      return res.status(403).json(blockedResponseBody(user));
+    }
+
     const token = signToken({ user: { id: user._id.toString(), role: user.role } });
     res.status(200).json({
       success: true,
@@ -300,13 +330,23 @@ async function setPassword(req, res, next) {
 async function login(req, res, next) {
   try {
     const { loginId, password } = req.body;
-    const id = loginId.trim().toLowerCase();
-    const user = await User.findOne({
-      $or: [{ email: id }, { phone: id.replace(/\s/g, "") }],
-    }).select("+password");
+    const user = await User.findOne(buildLoginQuery(loginId)).select("+password");
 
-    if (!user || !user.password) {
+    if (!user) {
       return res.status(401).json({ success: false, message: "Invalid email/phone or password." });
+    }
+
+    if (isUserBlocked(user)) {
+      return res.status(403).json(blockedResponseBody(user));
+    }
+
+    if (!user.password) {
+      return res.status(401).json({
+        success: false,
+        code: "PASSWORD_NOT_SET",
+        message:
+          "No password is set on this account yet. Use Forgot password to verify your email or phone and create one.",
+      });
     }
 
     const bcrypt = require("bcryptjs");
@@ -320,53 +360,6 @@ async function login(req, res, next) {
     delete u.password;
     res.status(200).json({ success: true, token, user: u });
   } catch (err) {
-    next(err);
-  }
-}
-
-/**
- * POST /auth/google
- * Body: idToken (from Google Sign-In)
- */
-async function googleAuth(req, res, next) {
-  try {
-    if (!hasGoogleAuth) {
-      return res.status(503).json({ success: false, message: "Google Sign-In is not configured." });
-    }
-    const { idToken } = req.body;
-    const ticket = await new (require("google-auth-library").OAuth2Client)().verifyIdToken({
-      idToken,
-      audience: googleAudiences,
-    });
-    const payload = ticket.getPayload();
-    const googleId = payload.sub;
-    const email = (payload.email || "").toLowerCase();
-    const name = payload.name || payload.given_name || "";
-
-    let user = await User.findOne({ googleId });
-    if (!user) {
-      user = await User.findOne({ email });
-      if (user) {
-        user.googleId = googleId;
-        user.fullName = user.fullName || name;
-        user.emailVerified = true;
-        await user.save();
-      } else {
-        user = await User.create({
-          googleId,
-          email,
-          fullName: name,
-          emailVerified: true,
-          phoneVerified: false,
-        });
-      }
-    }
-
-    const token = signToken({ user: { id: user._id.toString(), role: user.role } });
-    const u = user.toJSON ? user.toJSON() : user;
-    res.status(200).json({ success: true, token, user: u });
-  } catch (err) {
-    if (err.statusCode) return res.status(err.statusCode).json({ success: false, message: err.message });
     next(err);
   }
 }
@@ -520,6 +513,10 @@ async function resetPassword(req, res, next) {
       );
     }
 
+    if (isUserBlocked(user)) {
+      return res.status(403).json(blockedResponseBody(user));
+    }
+
     const token = signToken({ user: { id: user._id.toString(), role: user.role } });
     const u = user.toJSON ? user.toJSON() : user;
     delete u.password;
@@ -547,7 +544,7 @@ async function changePassword(req, res, next) {
     const { currentPassword, newPassword } = req.body;
     const user = await User.findById(req.userId).select("+password");
     if (!user) {
-      return res.status(404).json({ success: false, message: "User not found." });
+      return respondAccountNoLongerAvailable(res, req.userId);
     }
     if (!user.password) {
       return res.status(400).json({
@@ -595,7 +592,6 @@ module.exports = {
   verifyOtp,
   setPassword,
   login,
-  googleAuth,
   forgotPassword,
   verifyForgotPasswordOtp,
   resetPassword,

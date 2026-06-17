@@ -1,6 +1,7 @@
 const User = require("../model/User.model");
 const s3Service = require("../services/s3.service");
 const { emitOutboxEvent } = require("../services/outbox.service");
+const { respondAccountNoLongerAvailable } = require("../utility/accountGoneResponse");
 const multer = require("multer");
 
 const upload = multer({
@@ -24,7 +25,7 @@ async function getProfile(req, res, next) {
   try {
     const user = await User.findById(req.userId).lean();
     if (!user) {
-      return res.status(404).json({ success: false, message: "User not found." });
+      return respondAccountNoLongerAvailable(res, req.userId);
     }
     delete user.password;
     let profilePhotoUrl = null;
@@ -66,7 +67,7 @@ async function updateProfile(req, res, next) {
     ).lean();
 
     if (!user) {
-      return res.status(404).json({ success: false, message: "User not found." });
+      return respondAccountNoLongerAvailable(res, req.userId);
     }
     delete user.password;
     res.status(200).json({ success: true, profile: user });
@@ -103,6 +104,9 @@ function uploadPhoto(req, res, next) {
         { $set: { profilePhoto: key } },
         { new: true }
       ).lean();
+      if (!user) {
+        return respondAccountNoLongerAvailable(res, req.userId);
+      }
       delete user.password;
       let profilePhotoUrl = null;
       try {

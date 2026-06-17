@@ -15,6 +15,7 @@ const { errorHandler } = require("./middleware/error.middleware");
 const { protect } = require("./middleware/auth.middleware");
 const User = require("./model/User.model");
 const s3Service = require("./services/s3.service");
+const { respondAccountNoLongerAvailable } = require("./utility/accountGoneResponse");
 
 // DB
 connectToDb();
@@ -42,7 +43,7 @@ app.use("/auth", authRoutes);
 app.get("/auth/me", protect, async (req, res, next) => {
   try {
     const user = await User.findById(req.userId).lean();
-    if (!user) return res.status(404).json({ success: false, message: "User not found." });
+    if (!user) return respondAccountNoLongerAvailable(res, req.userId);
     delete user.password;
     let profilePhotoUrl = null;
     if (user.profilePhoto) {

@@ -12,6 +12,17 @@ function haversineKm(lat1, lon1, lat2, lon2) {
   return R * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
 }
 
+/**
+ * Pakistani city grids force ride-share routes ~20-30% longer than great-circle
+ * (one-ways, canal/ringroad detours). Scale haversine for fare math only;
+ * ETA stays on raw haversine to avoid double-inflating travel time.
+ */
+const URBAN_DISTANCE_FACTOR = 1.25;
+
+function urbanRoadKm(haversine) {
+  return haversine * URBAN_DISTANCE_FACTOR;
+}
+
 function calcEtaMinutes(distanceKm, avgSpeedKmh = 28) {
   const minutes = (distanceKm / avgSpeedKmh) * 60;
   return Math.max(1, Math.round(minutes));
@@ -19,15 +30,19 @@ function calcEtaMinutes(distanceKm, avgSpeedKmh = 28) {
 
 /**
  * Heuristic PK urban ride costs (no official APIs).
- * Calibrated so ~5.3 km car (no AC) is in the ballpark of real Yango / Bykea (Alto-class vs Wagon-R–class fleet).
+ * Calibrated against captured Yango / Bykea Lahore fares mid-2026:
+ *   Bykea Car (no-AC) ≈ Rs.801 for 14.76 km; Yango Comfort ≈ Rs.686.
+ * Provider tilts + Pakistan POL multiplier (~1.09 at petrol Rs.399.86/L)
+ * sit on top, so the per-km rates here are deliberately ~22% lower than
+ * the live captured PKR/km to leave room for those multipliers.
  */
 const RIDE_TYPE_BASE = {
-  bike: { baseFare: 72, perKmRate: 22 },
-  rickshaw: { baseFare: 88, perKmRate: 26 },
-  car: { baseFare: 78, perKmRate: 35 },
-  /** Car with AC — modest uplift vs no-AC car bucket. */
-  car_ac: { baseFare: 92, perKmRate: 40 },
-  premium: { baseFare: 120, perKmRate: 48 },
+  bike: { baseFare: 75, perKmRate: 24 },
+  rickshaw: { baseFare: 95, perKmRate: 28 },
+  car: { baseFare: 90, perKmRate: 38 },
+  /** Car with AC — meaningful uplift vs no-AC car bucket (typical PK provider gap). */
+  car_ac: { baseFare: 110, perKmRate: 46 },
+  premium: { baseFare: 140, perKmRate: 60 },
 };
 
 /**
@@ -37,19 +52,19 @@ const RIDE_TYPE_BASE = {
 const FUEL_SURCHARGE_MULTIPLIER = 1.03;
 
 const PROVIDER_CONFIG = {
-  /** Yango: lighter fleet (e.g. Alto) — lower per-trip tilt vs Bykea. */
+  /** Yango: lighter fleet (e.g. Alto). Tilt close to but below Bykea. */
   Yango: {
     baseAdd: 8,
     etaMultiplier: 1.0,
-    confidence: 0.74,
-    priceTilt: 0.88,
+    confidence: 0.78,
+    priceTilt: 0.95,
   },
-  /** Bykea: heavier local fleet (e.g. Wagon R) — higher tilt; ~25–32% above Yango at same km. */
+  /** Bykea: heavier local fleet (e.g. Wagon R). Higher tilt; min spread vs Yango enforced below. */
   Bykea: {
     baseAdd: 18,
     etaMultiplier: 1.02,
-    confidence: 0.71,
-    priceTilt: 1.1,
+    confidence: 0.75,
+    priceTilt: 1.12,
   },
 };
 
@@ -90,11 +105,11 @@ function pakistanDemandMultiplier(date = new Date()) {
 
   let m = 1.0;
   if (hour >= 7 && hour <= 10) m = Math.max(m, 1.06);
-  if (hour >= 17 && hour <= 21) m = Math.max(m, 1.1);
-  if (hour >= 22 || hour <= 5) m = Math.max(m, 1.03);
-  if (isFri && hour >= 16 && hour <= 21) m = Math.max(m, 1.12);
-  if (isWeekend && hour >= 12 && hour <= 23) m = Math.max(m, 1.06);
-  return Math.min(1.15, m);
+  if (hour >= 17 && hour <= 21) m = Math.max(m, 1.12);
+  if (hour >= 22 || hour <= 5) m = Math.max(m, 1.04);
+  if (isFri && hour >= 16 && hour <= 21) m = Math.max(m, 1.16);
+  if (isWeekend && hour >= 12 && hour <= 23) m = Math.max(m, 1.08);
+  return Math.min(1.18, m);
 }
 
 /** One column per provider: ride-type label only (brand prefix applied when building the name). */
@@ -135,11 +150,12 @@ function resolveFareModel(rideType, carAc = false) {
 
 /**
  * Minimum fare for route + ride type (no provider markup, no booking side effects).
+ * @param {number} distanceKm urban-road km (haversine × URBAN_DISTANCE_FACTOR)
  */
 function computeBaseEstimate(rideType, distanceKm) {
   const model = RIDE_TYPE_BASE[rideType] || RIDE_TYPE_BASE.car;
   return {
-    baseFare: Math.max(80, Math.round(model.baseFare + distanceKm * model.perKmRate)),
+    baseFare: Math.max(100, Math.round(model.baseFare + distanceKm * model.perKmRate)),
     perKmRate: model.perKmRate,
   };
 }
@@ -209,7 +225,8 @@ function estimateMinFare({ pickupCoords, destinationCoords, rideType, carAc, liv
     throw err;
   }
 
-  const distanceKm = haversineKm(lat1, lon1, lat2, lon2);
+  const haversine = haversineKm(lat1, lon1, lat2, lon2);
+  const distanceKm = urbanRoadKm(haversine);
   const fareModel = resolveFareModel(rideType, carAc);
   const base = computeBaseEstimate(fareModel, distanceKm);
   const scraped = parseLiveCalibrationRows(liveCalibration);
@@ -266,12 +283,13 @@ function findRides({
     throw err;
   }
 
-  const distanceKm = haversineKm(
+  const haversine = haversineKm(
     pickupCoords.latitude,
     pickupCoords.longitude,
     destinationCoords.latitude,
     destinationCoords.longitude
   );
+  const distanceKm = urbanRoadKm(haversine);
   const userRideType = String(rideType || 'car').trim().toLowerCase();
   const fareModel = resolveFareModel(userRideType, carAc);
   const base = computeBaseEstimate(fareModel, distanceKm);
@@ -304,7 +322,7 @@ function findRides({
       estimateConfidence = Math.min(0.96, cfg.confidence + 0.14);
       fareSource = 'scraped_blend';
     }
-    const etaMins = calcEtaMinutes(distanceKm * cfg.etaMultiplier);
+    const etaMins = calcEtaMinutes(haversine * cfg.etaMultiplier);
     return {
       id: `${provider.toLowerCase()}_${Date.now()}`,
       provider,

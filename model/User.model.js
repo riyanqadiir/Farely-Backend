@@ -56,6 +56,22 @@ const UserSchema = new mongoose.Schema(
     lastPasswordResetAt: { type: Date, default: null },
     /** Updated on app foreground (heartbeat) for operational analytics. */
     lastActiveAt: { type: Date, default: null, index: true },
+
+    /**
+     * Admin moderation fields. Written by the Farely Admin Console
+     * (POST /admin/users/mobile/:id/block | /unblock). Read here at
+     * login + every authenticated request so an admin's action takes
+     * effect immediately and outlives any already-issued JWT.
+     *
+     * `blockedUntil = null` together with `blocked = true` means a
+     * permanent block. A temporary block auto-expires the moment
+     * `Date.now() > blockedUntil` — checked at read time, no cron.
+     */
+    blocked: { type: Boolean, default: false, index: true },
+    blockedAt: { type: Date, default: null },
+    blockedUntil: { type: Date, default: null },
+    blockedReason: { type: String, default: null, maxlength: 500 },
+    blockedByAdminId: { type: String, default: null },
   },
   {
     timestamps: true,

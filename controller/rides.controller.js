@@ -4,6 +4,16 @@ const RideSearchLog = require("../model/RideSearchLog.model");
 const ProviderSelectionLog = require("../model/ProviderSelectionLog.model");
 const RideHandoff = require("../model/RideHandoff.model");
 const { emitOutboxEvent } = require("../services/outbox.service");
+const {
+  PREDEFINED_AREAS,
+  getCityCenter,
+  getCities,
+} = require("../service/predefinedAreas.service");
+const {
+  measureTraffic,
+  isGoogleConfigured,
+  surgeFromRatio,
+} = require("../service/googleTraffic.service");
 
 const SERVICE_AREA = {
   // Pakistan bounding box (coarse service area guardrail).
@@ -92,6 +102,110 @@ function inServiceArea({ latitude, longitude }) {
   return inside;
 }
 
+function validStoredCoords(coords) {
+  return (
+    coords
+    && typeof coords.latitude === "number"
+    && typeof coords.longitude === "number"
+    && Number.isFinite(coords.latitude)
+    && Number.isFinite(coords.longitude)
+    && !(coords.latitude === 0 && coords.longitude === 0)
+  );
+}
+
+async function enrichRouteFromSearchLog(searchLogId, pickup, destination, pickupCoords, destinationCoords) {
+  let outPickup = String(pickup || "").trim();
+  let outDest = String(destination || "").trim();
+  let outPk = validStoredCoords(pickupCoords) ? pickupCoords : null;
+  let outDestCoords = validStoredCoords(destinationCoords) ? destinationCoords : null;
+
+  if (!searchLogId) {
+    return { pickup: outPickup, destination: outDest, pickupCoords: outPk, destinationCoords: outDestCoords };
+  }
+
+  const search = await RideSearchLog.findById(searchLogId).lean();
+  if (!search) {
+    return { pickup: outPickup, destination: outDest, pickupCoords: outPk, destinationCoords: outDestCoords };
+  }
+
+  if (!outPickup && search.pickup) outPickup = String(search.pickup).trim();
+  if (!outDest && search.destination) outDest = String(search.destination).trim();
+  if (!outPk && validStoredCoords(search.pickupCoords)) outPk = search.pickupCoords;
+  if (!outDestCoords && validStoredCoords(search.destinationCoords)) outDestCoords = search.destinationCoords;
+
+  return { pickup: outPickup, destination: outDest, pickupCoords: outPk, destinationCoords: outDestCoords };
+}
+
+function handoffHasRouteData(route) {
+  const pickup = String(route?.pickup || "").trim();
+  const dest = String(route?.destination || "").trim();
+  if (pickup && dest) return true;
+  return validStoredCoords(route?.pickupCoords) && validStoredCoords(route?.destinationCoords);
+}
+
+function handoffOutboxPayload(doc) {
+  return {
+    id: String(doc._id),
+    userId: String(doc.userId),
+    searchLogId: doc.searchLogId ? String(doc.searchLogId) : null,
+    provider: doc.provider,
+    rideType: doc.rideType,
+    carAc: Boolean(doc.carAc),
+    pickup: doc.pickup,
+    destination: doc.destination,
+    pickupCoords: doc.pickupCoords || null,
+    destinationCoords: doc.destinationCoords || null,
+    estimatedFare: doc.estimatedFare,
+    capturedFare: typeof doc.capturedFare === "number" ? doc.capturedFare : null,
+    capturedProvider: doc.capturedProvider || null,
+    status: doc.status,
+    redirectSucceeded: doc.redirectSucceeded,
+    createdAt: doc.createdAt,
+    city: "Lahore",
+  };
+}
+
+async function findLatestRoutePlannedHandoff(userId, searchLogId) {
+  const query = { userId, status: "route_planned" };
+  if (searchLogId) {
+    query.searchLogId = searchLogId;
+  }
+  return RideHandoff.findOne(query).sort({ createdAt: -1 });
+}
+
+function applyProviderHandoffFields(doc, route, fields) {
+  const {
+    searchLogId,
+    selectionLogId,
+    rideType,
+    carAcEffective,
+    provider,
+    providerRideName,
+    estimatedFare,
+    redirectSucceeded,
+    redirectMode,
+    failureReason,
+    openedUrl,
+  } = fields;
+
+  doc.searchLogId = searchLogId || doc.searchLogId;
+  doc.selectionLogId = selectionLogId || doc.selectionLogId;
+  doc.pickup = route.pickup;
+  doc.destination = route.destination;
+  doc.pickupCoords = route.pickupCoords;
+  doc.destinationCoords = route.destinationCoords;
+  doc.rideType = rideType || "car";
+  doc.carAc = carAcEffective;
+  doc.provider = provider.trim();
+  doc.providerRideName = providerRideName || "";
+  doc.estimatedFare = typeof estimatedFare === "number" ? estimatedFare : null;
+  doc.redirectSucceeded = Boolean(redirectSucceeded);
+  doc.redirectMode = redirectMode || "unknown";
+  doc.failureReason = failureReason || "";
+  doc.openedUrl = typeof openedUrl === "string" ? openedUrl.slice(0, 2000) : "";
+  doc.status = redirectSucceeded ? "handoff_opened" : "handoff_failed";
+}
+
 function parseAndValidateCoords({ pickupLat, pickupLng, destinationLat, destinationLng }) {
   const pLat = toFiniteNumber(pickupLat);
   const pLng = toFiniteNumber(pickupLng);
@@ -169,7 +283,7 @@ async function compare(req, res, next) {
     const { liveCalibration } = req.body || {};
 
     const fuelSnap = await pakistanFuelService.getPakistanFuelSnapshot();
-    const data = rideSimulationService.findRides({
+    const compareInput = {
       pickup,
       destination,
       pickupCoords,
@@ -179,7 +293,13 @@ async function compare(req, res, next) {
       liveCalibration,
       fuelMultiplier: fuelSnap.fuelMultiplierForRides,
       fuelPricingSource: fuelSnap.source,
-    });
+    };
+    const data = rideSimulationService.findRides(compareInput);
+    // Ride search logs are an audit trail of Farely model estimates only.
+    // Live Yango/Bykea scrapes may still shape the JSON response for the app UI.
+    const logSnapshot = liveCalibration?.length
+      ? rideSimulationService.findRides({ ...compareInput, liveCalibration: undefined })
+      : data;
     data.pakistanFuel = {
       petrolPkrPerL: fuelSnap.petrolPkrPerL,
       dieselPkrPerL: fuelSnap.dieselPkrPerL,
@@ -195,13 +315,13 @@ async function compare(req, res, next) {
       destination,
       pickupCoords,
       destinationCoords,
-      rideType: data.rideType,
-      carAc: Boolean(data.carAc),
-      distanceKm: data.distanceKm,
-      baseFare: data.baseFare,
-      perKmRate: data.perKmRate,
-      estimateNotice: data.estimateNotice || "",
-      comparisons: (data.comparisons || []).map((item) => ({
+      rideType: logSnapshot.rideType,
+      carAc: Boolean(logSnapshot.carAc),
+      distanceKm: logSnapshot.distanceKm,
+      baseFare: logSnapshot.baseFare,
+      perKmRate: logSnapshot.perKmRate,
+      estimateNotice: logSnapshot.estimateNotice || "",
+      comparisons: (logSnapshot.comparisons || []).map((item) => ({
         provider: item.provider,
         name: item.name,
         fare: item.fare,
@@ -299,20 +419,64 @@ async function logProviderSelection(req, res, next) {
       redirectMode: redirectMode || "unknown",
       failureReason: failureReason || "",
     });
-    await emitOutboxEvent("ride.provider_selection.created", created._id, {
-      id: String(created._id),
-      userId: String(req.userId),
-      searchLogId: created.searchLogId ? String(created.searchLogId) : null,
-      provider: created.provider,
-      rideType: created.rideType,
-      carAc: created.carAc,
-      estimatedFare: created.estimatedFare,
-      redirectAttempted: created.redirectAttempted,
-      redirectSucceeded: created.redirectSucceeded,
-      createdAt: created.createdAt,
-    });
+    // Analytics only — do not emit as ride.* (admin trip routes used to show empty rows).
 
     return res.status(201).json({ success: true, id: created._id });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * POST /rides/ride-handoff/plan-route
+ * Register pickup/destination when Compare rides opens (before opening Yango/Bykea).
+ */
+async function planRideRoute(req, res, next) {
+  try {
+    const {
+      searchLogId,
+      pickup,
+      destination,
+      pickupCoords,
+      destinationCoords,
+      rideType,
+      carAc,
+    } = req.body || {};
+
+    const carAcEffective = effectiveCarAc(rideType || "car", parseCarAcFlag(carAc));
+    const route = await enrichRouteFromSearchLog(
+      searchLogId,
+      pickup,
+      destination,
+      pickupCoords,
+      destinationCoords
+    );
+
+    if (!handoffHasRouteData(route)) {
+      return res.status(400).json({
+        msg: "Pickup and destination with coordinates are required before logging this trip.",
+      });
+    }
+
+    const doc = await RideHandoff.create({
+      userId: req.userId,
+      searchLogId: searchLogId || null,
+      pickup: route.pickup,
+      destination: route.destination,
+      pickupCoords: route.pickupCoords,
+      destinationCoords: route.destinationCoords,
+      rideType: rideType || "car",
+      carAc: carAcEffective,
+      provider: "Pending",
+      providerRideName: "Compare rides",
+      estimatedFare: null,
+      redirectSucceeded: false,
+      redirectMode: "pending",
+      status: "route_planned",
+    });
+    // Internal route registration only — admin ingest starts on provider open.
+
+    return res.status(201).json({ success: true, id: doc._id, status: doc.status });
   } catch (err) {
     next(err);
   }
@@ -344,20 +508,64 @@ async function recordRideHandoff(req, res, next) {
       return res.status(400).json({ msg: "provider is required" });
     }
 
-    const doc = await RideHandoff.create({
+    const { plannedHandoffId } = req.body || {};
+
+    const route = await enrichRouteFromSearchLog(
+      searchLogId,
+      pickup,
+      destination,
+      pickupCoords,
+      destinationCoords
+    );
+
+    if (!handoffHasRouteData(route)) {
+      return res.status(400).json({
+        msg: "Pickup and destination with coordinates are required to open a provider app.",
+      });
+    }
+
+    const handoffFields = {
+      searchLogId: searchLogId || null,
+      selectionLogId: selectionLogId || null,
+      rideType: rideType || "car",
+      carAcEffective,
+      provider,
+      providerRideName: providerRideName || "",
+      estimatedFare,
+      redirectSucceeded,
+      redirectMode,
+      failureReason,
+      openedUrl,
+    };
+
+    let doc = null;
+    let planned = null;
+    if (plannedHandoffId) {
+      planned = await RideHandoff.findOne({
+        _id: plannedHandoffId,
+        userId: req.userId,
+        status: "route_planned",
+      });
+    }
+    if (!planned) {
+      planned = await findLatestRoutePlannedHandoff(req.userId, searchLogId || null);
+    }
+    if (planned) {
+      applyProviderHandoffFields(planned, route, handoffFields);
+      await planned.save();
+      doc = planned;
+      await emitOutboxEvent("ride.handoff.created", doc._id, handoffOutboxPayload(doc));
+      return res.status(200).json({ success: true, id: doc._id, updated: true });
+    }
+
+    doc = await RideHandoff.create({
       userId: req.userId,
       searchLogId: searchLogId || null,
       selectionLogId: selectionLogId || null,
-      pickup: pickup || "",
-      destination: destination || "",
-      ...(pickupCoords && typeof pickupCoords.latitude === "number"
-        && typeof pickupCoords.longitude === "number"
-        ? { pickupCoords }
-        : {}),
-      ...(destinationCoords && typeof destinationCoords.latitude === "number"
-        && typeof destinationCoords.longitude === "number"
-        ? { destinationCoords }
-        : {}),
+      pickup: route.pickup,
+      destination: route.destination,
+      pickupCoords: route.pickupCoords,
+      destinationCoords: route.destinationCoords,
       rideType: rideType || "car",
       carAc: carAcEffective,
       provider: provider.trim(),
@@ -369,21 +577,7 @@ async function recordRideHandoff(req, res, next) {
       openedUrl: typeof openedUrl === "string" ? openedUrl.slice(0, 2000) : "",
       status: redirectSucceeded ? "handoff_opened" : "handoff_failed",
     });
-    await emitOutboxEvent("ride.handoff.created", doc._id, {
-      id: String(doc._id),
-      userId: String(req.userId),
-      provider: doc.provider,
-      rideType: doc.rideType,
-      pickup: doc.pickup,
-      destination: doc.destination,
-      pickupCoords: doc.pickupCoords || null,
-      destinationCoords: doc.destinationCoords || null,
-      estimatedFare: doc.estimatedFare,
-      status: doc.status,
-      redirectSucceeded: doc.redirectSucceeded,
-      createdAt: doc.createdAt,
-      city: "Lahore",
-    });
+    await emitOutboxEvent("ride.handoff.created", doc._id, handoffOutboxPayload(doc));
 
     return res.status(201).json({ success: true, id: doc._id });
   } catch (err) {
@@ -393,7 +587,7 @@ async function recordRideHandoff(req, res, next) {
 
 async function confirmRideHandoff(req, res, next) {
   try {
-    const { handoffId, taken } = req.body || {};
+    const { handoffId, taken, capturedFare, capturedProvider } = req.body || {};
     if (!handoffId) {
       return res.status(400).json({ msg: "handoffId is required" });
     }
@@ -406,28 +600,77 @@ async function confirmRideHandoff(req, res, next) {
       return res.status(404).json({ msg: "Ride handoff not found" });
     }
 
+    const fare = Number(capturedFare);
+    const hadCapture = typeof handoff.capturedFare === "number" && handoff.capturedFare > 0;
+    if (!hadCapture && Number.isFinite(fare) && fare > 0) {
+      handoff.capturedFare = Math.round(fare);
+      handoff.capturedFareAt = new Date();
+      if (capturedProvider && typeof capturedProvider === "string") {
+        handoff.capturedProvider = capturedProvider.trim();
+      }
+    }
+
     handoff.userConfirmedTaken = taken;
     handoff.userConfirmedAt = new Date();
     handoff.status = taken ? "ride_confirmed" : "ride_not_taken";
     await handoff.save();
-    await emitOutboxEvent(taken ? "ride.handoff.confirmed" : "ride.handoff.rejected", handoff._id, {
-      id: String(handoff._id),
-      userId: String(req.userId),
-      provider: handoff.provider,
-      rideType: handoff.rideType,
-      pickup: handoff.pickup,
-      destination: handoff.destination,
-      pickupCoords: handoff.pickupCoords || null,
-      destinationCoords: handoff.destinationCoords || null,
-      estimatedFare: handoff.estimatedFare,
-      status: handoff.status,
-      redirectSucceeded: handoff.redirectSucceeded,
-      userConfirmedAt: handoff.userConfirmedAt,
-      createdAt: handoff.createdAt,
-      city: "Lahore",
-    });
+
+    if (!hadCapture && typeof handoff.capturedFare === "number" && handoff.capturedFare > 0) {
+      await emitOutboxEvent("ride.handoff.capture_updated", handoff._id, handoffOutboxPayload(handoff));
+    }
+
+    await emitOutboxEvent(
+      taken ? "ride.handoff.confirmed" : "ride.handoff.rejected",
+      handoff._id,
+      {
+        ...handoffOutboxPayload(handoff),
+        userConfirmedAt: handoff.userConfirmedAt,
+      }
+    );
 
     return res.json({ success: true, id: handoff._id, status: handoff.status });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * PATCH /rides/ride-handoff/:handoffId/capture
+ * Body: capturedFare, capturedProvider?
+ * Stores live provider fare separately from estimatedFare (audit + admin trip routes).
+ */
+async function updateHandoffCapture(req, res, next) {
+  try {
+    const { handoffId } = req.params;
+    const { capturedFare, capturedProvider } = req.body || {};
+    const fare = Number(capturedFare);
+    if (!handoffId) {
+      return res.status(400).json({ msg: "handoffId is required" });
+    }
+    if (!Number.isFinite(fare) || fare <= 0) {
+      return res.status(400).json({ msg: "capturedFare must be a positive number" });
+    }
+
+    const handoff = await RideHandoff.findOne({ _id: handoffId, userId: req.userId });
+    if (!handoff) {
+      return res.status(404).json({ msg: "Ride handoff not found" });
+    }
+
+    handoff.capturedFare = Math.round(fare);
+    handoff.capturedFareAt = new Date();
+    if (capturedProvider && typeof capturedProvider === "string") {
+      handoff.capturedProvider = capturedProvider.trim();
+    }
+    await handoff.save();
+
+    await emitOutboxEvent("ride.handoff.capture_updated", handoff._id, handoffOutboxPayload(handoff));
+
+    return res.json({
+      success: true,
+      id: handoff._id,
+      capturedFare: handoff.capturedFare,
+      estimatedFare: handoff.estimatedFare,
+    });
   } catch (err) {
     next(err);
   }
@@ -471,6 +714,103 @@ async function pakistanFuel(req, res, next) {
   }
 }
 
+/**
+ * GET /rides/traffic-hotspots
+ *
+ * Live Google-traffic surge per predefined Pakistani watch zone. The mobile
+ * client picks the zone closest to the rider's pickup (within ~2km) and
+ * multiplies the displayed fare by `surgeMultiplier`. Same tiers as the
+ * Admin Console's /admin/metrics/traffic-hotspots so admin map and rider
+ * UI always agree.
+ *
+ * Optional query: ?city=lahore|karachi|islamabad|rawalpindi
+ * Cached server-side for 5 min per origin/destination pair.
+ */
+async function listTrafficHotspots(req, res, next) {
+  try {
+    if (!isGoogleConfigured()) {
+      return res.status(503).json({
+        success: false,
+        code: "CONFIG_MISSING",
+        message:
+          "GOOGLE_MAPS_API_KEY is not set on the backend. Add it to backend/.env "
+          + "to enable live traffic hotspots.",
+      });
+    }
+
+    const cityFilter = req.query.city
+      ? String(req.query.city).toLowerCase().trim()
+      : null;
+    const areas = cityFilter
+      ? PREDEFINED_AREAS.filter((a) => a.city.toLowerCase() === cityFilter)
+      : PREDEFINED_AREAS;
+
+    const measurements = await Promise.all(
+      areas.map(async (area) => {
+        const measurement = await measureTraffic(area, getCityCenter(area.city));
+        return { area, measurement };
+      })
+    );
+
+    const items = measurements
+      .map(({ area, measurement }) => {
+        const ratio = measurement ? measurement.ratio : null;
+        const tier = ratio !== null
+          ? surgeFromRatio(ratio)
+          : { surgeMultiplier: 1, surgeLevel: "normal", surgePercent: 0 };
+        return {
+          key: area.key,
+          name: area.name,
+          city: area.city,
+          lat: area.lat,
+          lng: area.lng,
+          duration: measurement ? measurement.duration : null,
+          durationInTraffic: measurement ? measurement.durationInTraffic : null,
+          congestionRatio: ratio !== null ? Number(ratio.toFixed(3)) : null,
+          delayMinutes:
+            measurement && measurement.duration > 0
+              ? Math.max(
+                0,
+                Math.round((measurement.durationInTraffic - measurement.duration) / 60)
+              )
+              : null,
+          surgeMultiplier: tier.surgeMultiplier,
+          surgeLevel: tier.surgeLevel,
+          surgePercent: tier.surgePercent,
+          available: measurement !== null,
+        };
+      })
+      .sort((a, b) => (b.congestionRatio || 0) - (a.congestionRatio || 0));
+
+    const successfulItems = items.filter((i) => i.available);
+    const highSurgeCount = items.filter((i) => i.surgeLevel === "high").length;
+    const avgDelayMinutes = successfulItems.length
+      ? Math.round(
+        successfulItems.reduce((s, i) => s + (i.delayMinutes || 0), 0)
+        / successfulItems.length
+      )
+      : 0;
+
+    return res.json({
+      success: true,
+      data: {
+        fetchedAt: new Date().toISOString(),
+        cityFilter,
+        cities: getCities(),
+        summary: {
+          totalAreas: items.length,
+          availableAreas: successfulItems.length,
+          highSurgeCount,
+          avgDelayMinutes,
+        },
+        items,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
 async function listPendingRideReviews(req, res, next) {
   try {
     const docs = await RideHandoff.find({
@@ -494,9 +834,12 @@ module.exports = {
   estimateMin,
   pakistanFuel,
   logProviderSelection,
+  planRideRoute,
   recordRideHandoff,
+  updateHandoffCapture,
   confirmRideHandoff,
   listRideHistory,
   listPendingRideReviews,
+  listTrafficHotspots,
 };
 

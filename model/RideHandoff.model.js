@@ -41,11 +41,22 @@ const RideHandoffSchema = new mongoose.Schema(
 
     status: {
       type: String,
-      enum: ["handoff_opened", "handoff_failed", "ride_confirmed", "ride_not_taken"],
+      enum: [
+        "route_planned",
+        "handoff_opened",
+        "handoff_failed",
+        "ride_confirmed",
+        "ride_not_taken",
+      ],
       default: "handoff_opened",
     },
     userConfirmedTaken: { type: Boolean, default: null },
     userConfirmedAt: { type: Date, default: null },
+
+    /** Live fare from provider app (accessibility). Kept separate from estimatedFare. */
+    capturedFare: { type: Number, default: null },
+    capturedFareAt: { type: Date, default: null },
+    capturedProvider: { type: String, default: null, trim: true },
   },
   { timestamps: true }
 );

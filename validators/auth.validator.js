@@ -75,10 +75,6 @@ const login = [
   body("password").notEmpty().withMessage("Password is required"),
 ];
 
-const googleIdToken = [
-  body("idToken").trim().notEmpty().withMessage("Google ID token is required"),
-];
-
 const forgotPassword = [
   body("channel").isIn(["phone", "email"]).withMessage("Channel must be phone or email"),
   body("identifier").trim().notEmpty().withMessage("Email or phone is required"),
@@ -137,7 +133,6 @@ module.exports = {
   verifyOtp,
   setPassword,
   login,
-  googleIdToken,
   forgotPassword,
   resetPassword,
   resendOtp,
