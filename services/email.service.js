@@ -20,6 +20,13 @@ function getClient() {
 
 const DEFAULT_SENDER = { name: "Farely", email: process.env.BREVO_SENDER_EMAIL || "noreply@farely.com" };
 
+function brevoErrorDetail(err) {
+  const body = err?.response?.body || err?.body;
+  if (body?.message) return body.message;
+  if (typeof body === "string" && body.trim()) return body.trim();
+  return err?.message || "Unknown Brevo error";
+}
+
 /**
  * Send OTP email via Brevo.
  */
@@ -49,7 +56,10 @@ async function sendOtpEmail(toEmail, otp, purpose = "verification") {
   } catch (err) {
     if (process.env.NODE_ENV === "development") {
       console.warn("[DEV] Brevo sendOtpEmail failed. Falling back to console OTP.");
-      console.warn("[DEV] Reason:", err?.message || "Unknown Brevo error");
+      console.warn("[DEV] Reason:", brevoErrorDetail(err));
+      if (err?.status || err?.response?.statusCode) {
+        console.warn("[DEV] Brevo HTTP status:", err.status || err.response.statusCode);
+      }
       console.log("[DEV] Email OTP to", toEmail, ":", otp);
       return { messageId: "dev-fallback-" + Date.now() };
     }
@@ -76,7 +86,10 @@ async function sendTransactionalEmail(toEmail, subject, htmlContent) {
   } catch (err) {
     if (process.env.NODE_ENV === "development") {
       console.warn("[DEV] Brevo sendTransactionalEmail failed. Falling back to console log.");
-      console.warn("[DEV] Reason:", err?.message || "Unknown Brevo error");
+      console.warn("[DEV] Reason:", brevoErrorDetail(err));
+      if (err?.status || err?.response?.statusCode) {
+        console.warn("[DEV] Brevo HTTP status:", err.status || err.response.statusCode);
+      }
       console.log("[DEV] Email to", toEmail, subject);
       return { messageId: "dev-fallback-" + Date.now() };
     }

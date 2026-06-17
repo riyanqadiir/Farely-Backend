@@ -75,7 +75,18 @@ async function signup(req, res, next) {
     const emailNorm = email.trim().toLowerCase();
     const phoneNorm = fullPhone(phone, countryCode);
 
-    let user = await User.findOne({ $or: [{ email: emailNorm }, { phone: phoneNorm }] });
+    const byEmail = await User.findOne({ email: emailNorm });
+    const byPhone = await User.findOne({ phone: phoneNorm });
+
+    if (byEmail && byPhone && String(byEmail._id) !== String(byPhone._id)) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "This email and phone number belong to different accounts. Sign in with the matching account, or use a new email and phone together.",
+      });
+    }
+
+    let user = byEmail || byPhone;
     if (user) {
       if (user.password) {
         return res.status(400).json({
@@ -329,8 +340,13 @@ async function setPassword(req, res, next) {
  */
 async function login(req, res, next) {
   try {
-    const { loginId, password } = req.body;
-    const user = await User.findOne(buildLoginQuery(loginId)).select("+password");
+    const loginIdRaw = String(req.body?.loginId || '').trim();
+    const password = String(req.body?.password || '');
+    if (!loginIdRaw || !password) {
+      return res.status(400).json({ success: false, message: "Email/phone and password are required." });
+    }
+
+    const user = await User.findOne(buildLoginQuery(loginIdRaw)).select("+password");
 
     if (!user) {
       return res.status(401).json({ success: false, message: "Invalid email/phone or password." });
@@ -345,7 +361,7 @@ async function login(req, res, next) {
         success: false,
         code: "PASSWORD_NOT_SET",
         message:
-          "No password is set on this account yet. Use Forgot password to verify your email or phone and create one.",
+          "No password is set on this account yet. Finish signup (verify email and set password) or use Forgot password.",
       });
     }
 
