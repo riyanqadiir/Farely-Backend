@@ -50,11 +50,11 @@ async function getProfile(req, res, next) {
 
 /**
  * PUT /profile
- * Body: fullName?, phone?, email?, countryCode?, street?, city?, district?
+ * Body: fullName?, street?, city?, district? (email/phone are not mutable here)
  */
 async function updateProfile(req, res, next) {
   try {
-    const allowed = ["fullName", "phone", "email", "countryCode", "street", "city", "district"];
+    const allowed = ["fullName", "street", "city", "district"];
     const updates = {};
     for (const key of allowed) {
       if (req.body[key] !== undefined) updates[key] = req.body[key];
